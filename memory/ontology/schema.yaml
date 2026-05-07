@@ -1,0 +1,67 @@
+# Example Schema for Enhanced Ontology
+
+# Entity types with constraints
+types:
+  Person:
+    required:
+      - name
+    forbidden_properties:
+      - password
+
+  Project:
+    required:
+      - name
+      - status
+    status_enum:
+      - planning
+      - in_progress
+      - completed
+      - cancelled
+
+  Task:
+    required:
+      - title
+      - status
+    status_enum:
+      - open
+      - in_progress
+      - blocked
+      - done
+
+  Document:
+    required:
+      - title
+      - path
+
+# Relation types with constraints
+relations:
+  has_owner:
+    from_types: [Project, Task, Document]
+    to_types: [Person]
+    cardinality: one_to_one
+
+  has_member:
+    from_types: [Project]
+    to_types: [Person]
+    cardinality: one_to_many
+
+  has_task:
+    from_types: [Project]
+    to_types: [Task]
+    cardinality: one_to_many
+
+  assigned_to:
+    from_types: [Task]
+    to_types: [Person]
+    cardinality: one_to_one
+
+  contains:
+    from_types: [Project, Document]
+    to_types: [Document, Task]
+    acyclic: true
+
+# Global constraints
+constraints:
+  - "Entity.Person.email must match regex ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+  - "Relation.has_owner must have unique to_id per from_id"
+  - "Task.end_date must be after Task.start_date if both exist"

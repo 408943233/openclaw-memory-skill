@@ -1,0 +1,17 @@
+{
+  "authority_levels": {
+    "truth": 1,
+    "reference": 2,
+    "observation": 3,
+    "manual": 4
+  },
+  "decay": {
+    "half_life_days": 30,
+    "min_score": 0.1,
+    "review_interval_days": 7
+  },
+  "conflict_resolution": {
+    "auto_resolve_truth_level": true,
+    "send_notifications": true
+  }
+}
