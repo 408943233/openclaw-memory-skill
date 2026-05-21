@@ -612,7 +612,11 @@ class FileManager:
                     line = line.strip()
                     if not line:
                         continue
-                    record = json.loads(line)
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning(f"load_graph: skipping malformed JSON line")
+                        continue
                     op = record.get("op")
                     
                     if op == "create":
