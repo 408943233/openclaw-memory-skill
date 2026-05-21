@@ -1,67 +1,180 @@
-# Example Schema for Enhanced Ontology
+# SSM (Sentinel Site Memory) Schema — 18 entity types + relations
+# Validated by GraphValidator.validate_graph()
 
-# Entity types with constraints
 types:
-  Person:
-    required:
-      - name
-    forbidden_properties:
-      - password
-
+  System:
+    required: [name]
+    name_enum: []  # free-form
+  WebPage:
+    required: [url]
+  TaskRecording:
+    required: [task_id]
+  RecordingMetadata:
+    required: [operator_name]
+  FunctionalModule:
+    required: [name]
+  DataFlow:
+    required: [api]
+  Navigation:
+    required: [from_page, to_page]
+  DataEntity:
+    required: [name]
+  DesignSystem:
+    required: []
+  InteractionPattern:
+    required: [name]
+  UserPath:
+    required: [name]
+  UserIntent:
+    required: [intent_description]
+  BusinessFlow:
+    required: [name]
+  APIResponse:
+    required: [url]
+  APIContract:
+    required: [endpoint]
+  StaticResource:
+    required: [url]
+  ResourceGroup:
+    required: [resource_type]
+  Cookie:
+    required: [name, domain]
+  CookieDomain:
+    required: [domain]
+  JSError:
+    required: [message]
+  PageLoadEvent:
+    required: [url]
+  DOMSnapshot:
+    required: [url]
+  DOMFingerprint:
+    required: [fingerprint_hash]
+  DOMFingerprintSummary:
+    required: []
+  OperationSequence:
+    required: []
+  PageNavigation:
+    required: []
+  RrwebEventGroup:
+    required: []
+  CSSRule:
+    required: [selector]
+  DesignToken:
+    required: [token_type, value]
+  Breakpoint:
+    required: [name]
+  Component:
+    required: [tag]
+  LayoutSection:
+    required: []
+  PageStructure:
+    required: []
+  StyleSystem:
+    required: []
+  TechStack:
+    required: [technologies]
+  UserRole:
+    required: [name]
+  OptimizationOpportunity:
+    required: [description]
+  PrototypeDemo:
+    required: [file_path]
   Project:
-    required:
-      - name
-      - status
-    status_enum:
-      - planning
-      - in_progress
-      - completed
-      - cancelled
+    required: [name]
+  Screenshot:
+    required: [filename]
+  VideoKeyframe:
+    required: [filename]
 
-  Task:
-    required:
-      - title
-      - status
-    status_enum:
-      - open
-      - in_progress
-      - blocked
-      - done
-
-  Document:
-    required:
-      - title
-      - path
-
-# Relation types with constraints
 relations:
+  has_recording:
+    from_types: [System]
+    to_types: [TaskRecording]
+    cardinality: one_to_many
+  recorded:
+    from_types: [TaskRecording]
+    to_types: [WebPage]
+  has_page:
+    from_types: [System]
+    to_types: [WebPage]
+  has_module:
+    from_types: [System]
+    to_types: [FunctionalModule]
+  has_data_flow:
+    from_types: [System]
+    to_types: [DataFlow]
+  has_navigation:
+    from_types: [System]
+    to_types: [Navigation]
+  has_data_entity:
+    from_types: [System]
+    to_types: [DataEntity]
+  has_design_system:
+    from_types: [System]
+    to_types: [DesignSystem]
+    cardinality: one_to_one
+  has_entity:
+    from_types: [System]
+    to_types: [DataEntity]
+  has_resource:
+    from_types: [System, WebPage]
+    to_types: [ResourceGroup, StaticResource]
+  has_cookie:
+    from_types: [System]
+    to_types: [Cookie]
+  has_domain:
+    from_types: [System]
+    to_types: [CookieDomain]
+  has_error:
+    from_types: [System]
+    to_types: [JSError]
+  has_intent:
+    from_types: [TaskRecording]
+    to_types: [UserIntent]
+  has_flow:
+    from_types: [TaskRecording]
+    to_types: [BusinessFlow]
+  has_metadata:
+    from_types: [TaskRecording]
+    to_types: [RecordingMetadata]
+  has_api_response:
+    from_types: [System]
+    to_types: [APIResponse]
+  has_response:
+    from_types: [APIResponse]
+    to_types: [APIResponse]
+  has_structure:
+    from_types: [WebPage]
+    to_types: [PageStructure]
+  has_layout:
+    from_types: [WebPage]
+    to_types: [LayoutSection]
+  uses_styles:
+    from_types: [WebPage]
+    to_types: [StyleSystem]
+  has_rule:
+    from_types: [StyleSystem]
+    to_types: [CSSRule]
+  has_css_rule:
+    from_types: [WebPage]
+    to_types: [CSSRule]
+  has_design_token:
+    from_types: [WebPage, System]
+    to_types: [DesignToken]
+  contains_component:
+    from_types: [LayoutSection]
+    to_types: [Component]
+  has_child_section:
+    from_types: [LayoutSection]
+    to_types: [LayoutSection]
+  has_breakpoint:
+    from_types: [WebPage]
+    to_types: [Breakpoint]
   has_owner:
-    from_types: [Project, Task, Document]
-    to_types: [Person]
-    cardinality: one_to_one
+    from_types: []
+    to_types: []
 
-  has_member:
-    from_types: [Project]
-    to_types: [Person]
-    cardinality: one_to_many
-
-  has_task:
-    from_types: [Project]
-    to_types: [Task]
-    cardinality: one_to_many
-
-  assigned_to:
-    from_types: [Task]
-    to_types: [Person]
-    cardinality: one_to_one
-
-  contains:
-    from_types: [Project, Document]
-    to_types: [Document, Task]
-    acyclic: true
-
-# Global constraints
 constraints:
-  - "Entity.Person.email must match regex ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
-  - "Relation.has_owner must have unique to_id per from_id"
-  - "Task.end_date must be after Task.start_date if both exist"
+  - name: "System must have has_page relations"
+    check: "exists"
+    description: "Every System should have at least one WebPage"

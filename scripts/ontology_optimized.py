@@ -23,14 +23,40 @@ import argparse
 import json
 import uuid
 import time
+import logging
+import subprocess
+import fcntl
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 
+logger = logging.getLogger(__name__)
+
+def _get_commit_hash() -> str:
+    """获取当前代码仓库的 commit 版本号"""
+    try:
+        script_dir = Path(__file__).resolve().parent
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=str(script_dir), timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+_APP_VERSION = _get_commit_hash()
+
 DEFAULT_GRAPH_PATH = "memory/ontology/graph.jsonl"
 DEFAULT_SCHEMA_PATH = "memory/ontology/schema.yaml"
 DEFAULT_CONFIG_PATH = "memory/ontology/config.json"
+
+# Resolve config path relative to skill script directory (not cwd)
+_SCRIPT_DIR = Path(__file__).parent.parent
+_CONFIG_DIR = _SCRIPT_DIR / "memory" / "ontology"
+_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Authority Levels
 AUTHORITY_LEVELS = {
@@ -51,9 +77,12 @@ class ConfigManager:
     """Manages ontology configuration"""
     
     @staticmethod
-    def load_config(path: str = DEFAULT_CONFIG_PATH) -> Dict:
-        """Load configuration from file"""
-        config_path = Path(path)
+    def load_config(path: str = None) -> Dict:
+        """Load configuration from file. If path is relative, resolve to skill dir."""
+        resolved = Path(path) if path else _CONFIG_DIR / "config.json"
+        if not resolved.is_absolute():
+            resolved = _CONFIG_DIR / resolved.name
+        config_path = resolved
         if not config_path.exists():
             return {
                 "authority_levels": AUTHORITY_LEVELS,
@@ -68,9 +97,12 @@ class ConfigManager:
             return json.load(f)
     
     @staticmethod
-    def save_config(config: Dict, path: str = DEFAULT_CONFIG_PATH) -> None:
-        """Save configuration to file"""
-        config_path = Path(path)
+    def save_config(config: Dict, path: str = None) -> None:
+        """Save configuration to file."""
+        resolved = Path(path) if path else _CONFIG_DIR / "config.json"
+        if not resolved.is_absolute():
+            resolved = _CONFIG_DIR / resolved.name
+        config_path = resolved
         config_path.parent.mkdir(parents=True, exist_ok=True)
         
         with open(config_path, "w") as f:
@@ -114,37 +146,64 @@ class EntityManager:
     
     @staticmethod
     def create_entity(
-        type_name: str, 
-        properties: Dict, 
-        graph_path: str, 
+        type_name: str,
+        properties: Dict,
+        graph_path: str,
         entity_id: Optional[str] = None,
         confidence: float = 0.8,
         source: str = "manual",
         authority_level: str = "manual",
+        skip_dedup: bool = False,
         **metadata_kwargs
     ) -> Dict:
-        """Create a new entity with enhanced metadata."""
+        """Create a new entity with dedup via ConflictManager.
+        If a duplicate is found, resolve by authority→confidence→recency.
+        Returns the created or existing entity dict."""
         entity_id = entity_id or EntityManager.generate_id(type_name)
         timestamp = datetime.now(timezone.utc).isoformat()
-        
-        # Create metadata
+
         metadata = MetadataManager.create_metadata(
             confidence=confidence,
             source=source,
             authority_level=authority_level,
             **metadata_kwargs
         )
-        
+
         entity = {
             "id": entity_id,
             "type": type_name,
             "properties": properties,
             "metadata": metadata
         }
-        
+
+        if not skip_dedup:
+            existing_entities, _ = FileManager.load_graph(graph_path)
+            conflicts = ConflictManager.detect_conflicts(entity, existing_entities)
+            if conflicts:
+                conflict = conflicts[0]
+                existing = conflict["existing_entity"]
+                config = ConfigManager.load_config()
+                action = ConflictManager.resolve_conflict(entity, existing, config)
+
+                if action == "override":
+                    logger.info(f"conflict_override: {conflict['conflict_reason']} → update {existing['id'][:16]}")
+                    print(f"    [Skill] 冲突裁决(override): {conflict['conflict_reason']} → 更新 {existing['id']}")
+                    return EntityManager.update_entity(
+                        entity_id=existing["id"],
+                        properties=properties,
+                        graph_path=graph_path,
+                        confidence=confidence,
+                        source=source,
+                        authority_level=authority_level
+                    ) or existing
+                else:
+                    logger.info(f"conflict_ignore: {conflict['conflict_reason']} → keep {existing['id'][:16]}")
+                    print(f"    [Skill] 冲突裁决(ignore): {conflict['conflict_reason']} → 保留 {existing['id']}")
+                    return existing
+
         record = {"op": "create", "entity": entity, "timestamp": timestamp}
         FileManager.append_op(graph_path, record)
-        
+
         return entity
     
     @staticmethod
@@ -188,13 +247,37 @@ class EntityManager:
         return entities[entity_id]
     
     @staticmethod
+    def _parse_iso_timestamp(ts_str: str) -> float:
+        """Parse ISO timestamp safely, handling Z suffix and timezone variants."""
+        if not ts_str:
+            return 0.0
+        normalized = ts_str.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized).timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+
+    @staticmethod
     def calculate_decay_score(entity: Dict) -> float:
         """Calculate decay score based on last used time and importance."""
         config = ConfigManager.load_config()
         half_life = timedelta(days=config["decay"]["half_life_days"])
         
-        last_used = datetime.fromisoformat(entity["metadata"]["last_used"])
+        last_used_str = entity.get("metadata", {}).get("last_used", "")
+        if not last_used_str:
+            last_used_str = entity.get("metadata", {}).get("created", "")
+        
+        try:
+            last_used = datetime.fromisoformat(last_used_str)
+            if last_used.tzinfo is None:
+                last_used = last_used.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return 1.0
+        
         current_time = datetime.now(timezone.utc)
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        
         time_diff = current_time - last_used
         
         # Calculate decay based on exponential decay formula
@@ -222,10 +305,15 @@ class RelationManager:
         source: str = "manual",
         authority_level: str = "manual"
     ) -> Dict:
-        """Create a relation between entities with enhanced metadata."""
+        """Create a relation between entities with enhanced metadata. Idempotent."""
         timestamp = datetime.now(timezone.utc).isoformat()
         
-        # Create metadata
+        entities, existing_relations = FileManager.load_graph(graph_path)
+        for er in existing_relations:
+            if (er.get("from") == from_id and er.get("rel") == rel_type 
+                    and er.get("to") == to_id):
+                return er
+        
         metadata = MetadataManager.create_metadata(
             confidence=confidence,
             source=source,
@@ -250,61 +338,100 @@ class ConflictManager:
     
     @staticmethod
     def detect_conflicts(
-        new_entity: Dict, 
+        new_entity: Dict,
         existing_entities: Dict
-    ) -> List[str]:
-        """Detect conflicts between new entity and existing entities."""
+    ) -> List[Dict]:
+        """Detect conflicts between new entity and existing entities.
+        Returns list of {existing_id, existing_entity, conflict_reason}. Empty if no conflict."""
         conflicts = []
-        
-        # Check for same type with same name or key properties
+        new_type = new_entity.get("type", "?")
+        new_id = new_entity.get("id", "")[:16]
+        new_props = new_entity.get("properties", {})
+        same_type_count = sum(1 for e in existing_entities.values() if e.get("type") == new_type)
+        print(f"    [ConflictManager] 检测: type={new_type} id={new_id} | 已有同类型实体: {same_type_count}")
+
         for existing_id, existing in existing_entities.items():
-            if existing["type"] == new_entity["type"]:
-                # Check for name conflict
-                if ("name" in existing["properties"] and 
-                    "name" in new_entity["properties"] and
-                    existing["properties"]["name"] == new_entity["properties"]["name"] and
-                    existing_id != new_entity["id"]):
-                    conflicts.append(f"Name conflict: {new_entity['properties']['name']} already exists as {existing_id}")
-                
-                # Check for other key property conflicts based on type
-                if new_entity["type"] == "Person":
-                    if ("email" in existing["properties"] and 
-                        "email" in new_entity["properties"] and
-                        existing["properties"]["email"] == new_entity["properties"]["email"] and
-                        existing_id != new_entity["id"]):
-                        conflicts.append(f"Email conflict: {new_entity['properties']['email']} already exists as {existing_id}")
-        
+            if existing["type"] != new_type:
+                continue
+            if existing_id == new_entity.get("id"):
+                continue
+
+            reason = None
+            existing_props = existing.get("properties", {})
+
+            if new_props.get("name") and existing_props.get("name") == new_props["name"]:
+                reason = f"Name conflict: '{new_props['name']}'"
+            elif new_props.get("url") and existing_props.get("url") == new_props["url"]:
+                reason = f"URL conflict: '{new_props['url']}'"
+            elif new_props.get("api_path") and existing_props.get("api_path") == new_props["api_path"]:
+                reason = f"API path conflict: '{new_props['api_path']}'"
+            elif new_props.get("domain") and existing_props.get("domain") == new_props.get("domain") \
+                    and new_type == "CookieDomain":
+                reason = f"CookieDomain conflict: '{new_props['domain']}'"
+            elif new_props.get("fingerprint_hash") and existing_props.get("fingerprint_hash") == new_props["fingerprint_hash"]:
+                reason = f"Fingerprint hash conflict"
+            elif new_type == "System" and new_props.get("name") \
+                    and existing_props.get("name") == new_props["name"]:
+                reason = f"System name conflict: '{new_props['name']}'"
+            elif new_props.get("task_id") and existing_props.get("task_id") == new_props["task_id"] \
+                    and new_type in ("TaskRecording", "RecordingMetadata"):
+                reason = f"Task id conflict: '{new_props['task_id']}'"
+            elif new_props.get("title") and existing_props.get("title") == new_props["title"] \
+                    and new_props.get("url") and existing_props.get("url") == new_props["url"]:
+                reason = f"Title+URL conflict: '{new_props['title']}'"
+
+            if reason:
+                existing_authority = existing.get("metadata", {}).get("authority_level", "?")
+                existing_conf = existing.get("metadata", {}).get("confidence", "?")
+                logger.warning(f"conflict_detected: {reason} existing={existing_id[:16]} (auth={existing_authority}, conf={existing_conf})")
+                print(f"    [ConflictManager] ⚡ 冲突: {reason} | 已有: {existing_id[:16]} (auth={existing_authority}, conf={existing_conf})")
+                conflicts.append({
+                    "existing_id": existing_id,
+                    "existing_entity": existing,
+                    "conflict_reason": reason
+                })
+
+        if not conflicts and same_type_count == 0:
+            print(f"    [ConflictManager] ✅ 无同类型实体，无需去重")
+        elif not conflicts:
+            print(f"    [ConflictManager] ✅ 同类型实体 {same_type_count} 个但无冲突（name/url 等均不同）")
+
         return conflicts
     
     @staticmethod
     def resolve_conflict(
-        new_entity: Dict, 
+        new_entity: Dict,
         existing_entity: Dict,
         config: Dict
     ) -> str:
         """Resolve conflict between new and existing entity."""
-        # Get authority levels
         new_level = AUTHORITY_LEVELS.get(new_entity["metadata"]["authority_level"], 4)
         existing_level = AUTHORITY_LEVELS.get(existing_entity["metadata"]["authority_level"], 4)
-        
-        # Authority level resolution
+        new_conf = new_entity["metadata"]["confidence"]
+        existing_conf = existing_entity["metadata"]["confidence"]
+
+        print(f"    [ConflictManager] 裁决: new(auth={new_level}, conf={new_conf}) vs existing(auth={existing_level}, conf={existing_conf})")
+
         if new_level < existing_level:
-            return "override"  # New has higher authority
-        elif new_level > existing_level:
-            return "ignore"   # Existing has higher authority
-        
-        # Same authority level, resolve by confidence
-        if new_entity["metadata"]["confidence"] > existing_entity["metadata"]["confidence"]:
+            print(f"    [ConflictManager] → override (new authority {new_level} > existing {existing_level})")
             return "override"
-        
-        # Same confidence, resolve by recency
+        elif new_level > existing_level:
+            print(f"    [ConflictManager] → ignore (existing authority {existing_level} > new {new_level})")
+            return "ignore"
+
+        if new_conf > existing_conf:
+            print(f"    [ConflictManager] → override (new confidence {new_conf} > existing {existing_conf})")
+            return "override"
+
         new_time = datetime.fromisoformat(new_entity["metadata"]["created"])
         existing_time = datetime.fromisoformat(existing_entity["metadata"]["created"])
-        
+
         if new_time > existing_time:
+            print(f"    [ConflictManager] → override (new time {new_time.isoformat()[:19]} newer)")
             return "override"
-        
-        return "ignore"  # Default to keep existing
+
+        print(f"    [ConflictManager] → ignore (existing retained by default)")
+        return "ignore"
 
 class KnowledgeCompressor:
     """Handles knowledge compression and redundancy removal"""
@@ -323,9 +450,10 @@ class KnowledgeCompressor:
             entity_groups[entity["type"]].append((entity_id, entity))
         
         # Process each type group
+        compressible_types = ["Task", "Event", "Note", "JSError", "TaskRecording", "APIResponse",
+                              "RecordingMetadata", "OperationSequence", "PageLoadEvent"]
         for entity_type, group in entity_groups.items():
-            if entity_type in ["Task", "Event", "Note"]:
-                # These types often have similar content that can be compressed
+            if entity_type in compressible_types:
                 compressed_entities.update(KnowledgeCompressor._compress_similar_entities(group, graph_path))
             else:
                 # Keep other types as is
@@ -478,52 +606,75 @@ class FileManager:
             return entities, relations
         
         with open(graph_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                op = record.get("op")
-                
-                if op == "create":
-                    entity = record["entity"]
-                    entities[entity["id"]] = entity
-                elif op == "update":
-                    entity_id = record["id"]
-                    if entity_id in entities:
-                        entities[entity_id]["properties"].update(record.get("properties", {}))
-                        entities[entity_id]["metadata"]["updated"] = record.get("timestamp")
-                        entities[entity_id]["metadata"]["version"] += 1
-                        # Update metadata from update record if provided
-                        if "metadata" in record:
-                            entities[entity_id]["metadata"].update(record["metadata"])
-                elif op == "delete":
-                    entity_id = record["id"]
-                    entities.pop(entity_id, None)
-                elif op == "relate":
-                    relations.append({
-                        "from": record["from"],
-                        "rel": record["rel"],
-                        "to": record["to"],
-                        "properties": record.get("properties", {}),
-                        "metadata": record.get("metadata", {})
-                    })
-                elif op == "unrelate":
-                    relations = [r for r in relations 
-                               if not (r["from"] == record["from"] 
-                                      and r["rel"] == record["rel"] 
-                                      and r["to"] == record["to"])]
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    op = record.get("op")
+                    
+                    if op == "create":
+                        entity = record["entity"]
+                        entities[entity["id"]] = entity
+                    elif op == "update":
+                        entity_id = record["id"]
+                        if entity_id in entities:
+                            entities[entity_id]["properties"].update(record.get("properties", {}))
+                            entities[entity_id]["metadata"]["updated"] = record.get("timestamp")
+                            entities[entity_id]["metadata"]["version"] += 1
+                            if "metadata" in record:
+                                entities[entity_id]["metadata"].update(record["metadata"])
+                    elif op == "delete":
+                        entity_id = record["id"]
+                        entities.pop(entity_id, None)
+                    elif op == "relate":
+                        relations.append({
+                            "from": record["from"],
+                            "rel": record["rel"],
+                            "to": record["to"],
+                            "properties": record.get("properties", {}),
+                            "metadata": record.get("metadata", {})
+                        })
+                    elif op == "unrelate":
+                        relations = [r for r in relations 
+                                   if not (r["from"] == record["from"] 
+                                          and r["rel"] == record["rel"] 
+                                          and r["to"] == record["to"])]
+                    elif op == "mark_stale":
+                        entity_id = record["id"]
+                        if entity_id in entities:
+                            entities[entity_id]["metadata"]["stale"] = True
+                            entities[entity_id]["metadata"]["stale_score"] = record.get("score", 0)
+                            entities[entity_id]["metadata"]["stale_timestamp"] = record.get("timestamp")
+                    elif op == "merge":
+                        entity_id = record["id"]
+                        merged_into = record.get("merged_into", "")
+                        if entity_id in entities and merged_into:
+                            entities[entity_id]["metadata"]["merged_into"] = merged_into
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         
         return entities, relations
     
     @staticmethod
     def append_op(path: str, record: Dict) -> None:
-        """Append an operation to the graph file."""
+        """Append an operation to the graph file with file lock for concurrency safety."""
         graph_path = Path(path)
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         
+        op_type = record.get("op", "?")
+        entity_id = record.get("id", record.get("entity", {}).get("id", "?"))[:16]
+        logger.debug(f"append_op: {op_type} id={entity_id} path={graph_path.name}")
+        
         with open(graph_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(record) + "\n")
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 class GraphQuery:
     """Handles advanced graph queries"""
@@ -541,17 +692,19 @@ class GraphQuery:
         graph_path: str,
         include_stale: bool = False
     ) -> List[Dict]:
-        """Query entities by type and properties with decay filtering."""
+        """Query entities by type and properties with unified stale filtering.
+        An entity is considered stale if EITHER:
+          - It has been marked via op:mark_stale (metadata.stale == True)
+          - Its decay_score is below config threshold
+        """
         entities, _ = FileManager.load_graph(graph_path)
         results = []
         config = ConfigManager.load_config()
         
         for entity in entities.values():
-            # Check type filter
             if type_name and entity["type"] != type_name:
                 continue
             
-            # Check property filters
             match = True
             for key, value in where.items():
                 if entity["properties"].get(key) != value:
@@ -561,18 +714,19 @@ class GraphQuery:
             if not match:
                 continue
             
-            # Check if stale
             if not include_stale:
+                meta = entity.get("metadata", {})
+                if meta.get("stale") is True:
+                    continue
                 score = EntityManager.calculate_decay_score(entity)
                 if score < config["decay"]["min_score"]:
                     continue
             
             results.append(entity)
         
-        # Sort by confidence and recency
         results.sort(key=lambda e: (
             -e["metadata"]["confidence"],
-            -datetime.fromisoformat(e["metadata"]["created"]).timestamp()
+            -EntityManager._parse_iso_timestamp(e["metadata"].get("created", ""))
         ))
         
         return results
@@ -695,6 +849,44 @@ class GraphValidator:
                     errors.append(
                         f"{rel_type}: to entity {rel['to']} type {to_entity['type']} not in {to_types}"
                     )
+
+            if cardinality:
+                if cardinality == "one_to_one":
+                    from_entities = set(r["from"] for r in rels)
+                    to_entities = set(r["to"] for r in rels)
+                    if len(from_entities) != len(rels):
+                        errors.append(f"{rel_type}: one_to_one violation — duplicate from entity")
+                    if len(to_entities) != len(rels):
+                        errors.append(f"{rel_type}: one_to_one violation — duplicate to entity")
+                elif cardinality == "one_to_many":
+                    to_entities = set(r["to"] for r in rels)
+                    if len(to_entities) != len(rels):
+                        errors.append(f"{rel_type}: one_to_many violation — duplicate to entity")
+
+            if acyclic:
+                graph = defaultdict(set)
+                for rel in rels:
+                    graph[rel["from"]].add(rel["to"])
+                visited = set()
+                rec_stack = set()
+
+                def _has_cycle(node):
+                    if node in rec_stack:
+                        return True
+                    if node in visited:
+                        return False
+                    visited.add(node)
+                    rec_stack.add(node)
+                    for neighbor in graph.get(node, set()):
+                        if _has_cycle(neighbor):
+                            return True
+                    rec_stack.discard(node)
+                    return False
+
+                for node in list(graph.keys()):
+                    if _has_cycle(node):
+                        errors.append(f"{rel_type}: acyclic violation — cycle detected starting from {node}")
+                        break
         
         return errors
     
@@ -929,6 +1121,7 @@ class MigrationManager:
 
 def main():
     """Main entry point"""
+    logger.info(f"openclaw-memory-skill v{_APP_VERSION} starting")
     parser = argparse.ArgumentParser(description="Optimized Ontology graph operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
@@ -992,6 +1185,13 @@ def main():
     related_p.add_argument("--dir", "-d", choices=["outgoing", "incoming", "both"], default="outgoing")
     related_p.add_argument("--graph", "-g", default=DEFAULT_GRAPH_PATH)
     
+    # Unrelate entities
+    unrelate_p = subparsers.add_parser("unrelate", help="Remove relation")
+    unrelate_p.add_argument("--from", dest="from_id", required=True, help="From entity ID")
+    unrelate_p.add_argument("--rel", "-r", required=True, help="Relation type")
+    unrelate_p.add_argument("--to", dest="to_id", required=True, help="To entity ID")
+    unrelate_p.add_argument("--graph", "-g", default=DEFAULT_GRAPH_PATH)
+    
     # Validate graph
     validate_p = subparsers.add_parser("validate", help="Validate graph")
     validate_p.add_argument("--graph", "-g", default=DEFAULT_GRAPH_PATH)
@@ -1014,6 +1214,11 @@ def main():
     migrate_p = subparsers.add_parser("migrate", help="Migrate data from old ontology format")
     migrate_p.add_argument("--from", dest="old_path", required=True, help="Path to old graph.jsonl")
     migrate_p.add_argument("--to", dest="new_path", default=DEFAULT_GRAPH_PATH, help="Path to new graph.jsonl")
+    
+    # Stats
+    stats_p = subparsers.add_parser("stats", help="Show graph statistics")
+    stats_p.add_argument("--graph", "-g", default=DEFAULT_GRAPH_PATH)
+    stats_p.add_argument("--include-stale", action="store_true", help="Include stale entities")
     
     args = parser.parse_args()
     workspace_root = Path.cwd().resolve()
@@ -1097,6 +1302,16 @@ def main():
         results = GraphQuery.get_related(args.id, args.rel, args.graph, args.dir)
         print(json.dumps(results, indent=2, ensure_ascii=False))
     
+    elif args.command == "unrelate":
+        FileManager.append_op(args.graph, {
+            "op": "unrelate",
+            "from": args.from_id,
+            "rel": args.rel,
+            "to": args.to_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        print(json.dumps({"status": "unrelated", "from": args.from_id, "rel": args.rel, "to": args.to_id}, ensure_ascii=False))
+    
     elif args.command == "validate":
         errors = GraphValidator.validate_graph(args.graph, args.schema)
         if errors:
@@ -1149,6 +1364,35 @@ def main():
         )
         
         MigrationManager.migrate(args.old_path, args.new_path)
+    
+    elif args.command == "stats":
+        entities, relations = FileManager.load_graph(args.graph)
+        type_counts = {}
+        total_relations = len(relations)
+        stale_count = 0
+        
+        for e in entities.values():
+            t = e["type"]
+            type_counts[t] = type_counts.get(t, 0) + 1
+            meta = e.get("metadata", {})
+            if meta.get("stale") is True:
+                stale_count += 1
+            elif EntityManager.calculate_decay_score(e) < ConfigManager.load_config()["decay"]["min_score"]:
+                stale_count += 1
+        
+        rel_types = {}
+        for r in relations:
+            rt = r["rel"]
+            rel_types[rt] = rel_types.get(rt, 0) + 1
+        
+        output = {
+            "total_entities": len(entities),
+            "total_relations": total_relations,
+            "stale_count": stale_count if not args.include_stale else "n/a",
+            "entity_types": dict(sorted(type_counts.items(), key=lambda x: -x[1])),
+            "relation_types": dict(sorted(rel_types.items(), key=lambda x: -x[1]))
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
